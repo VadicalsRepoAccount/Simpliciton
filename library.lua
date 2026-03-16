@@ -1,23 +1,3 @@
--- ============================================================
---  Simpliciton  |  v3.1  "Framework Edition"
---  Fixed: Font API, AutomaticCanvasSize, DEBUG system
--- ============================================================
---
---  FIXES vs v3.0
---  ─────────────────────────────────────────────────────────
---  · Font.new() / FontFace / Enum.FontWeight  → Enum.Font.X
---    (Font.new is 2022+ only; Enum.Font works on all versions)
---  · AutomaticCanvasSize fallback via UIListLayout watcher
---    (silently fails on older clients; now always works)
---  · DEBUG flag  – enable at top for full trace output
---  · Every major operation wrapped in pcall with warn output
---  · Services resolved safely (pcall GetService)
---
---  HOW TO ENABLE DEBUG
---    Set  DEBUG = true  on the line below.
---    All [Simpliciton] output will appear in the dev console.
--- ============================================================
-
 local DEBUG = true   -- ← flip to true to enable debug logging
 
 local function DBG(tag, msg)
@@ -37,14 +17,18 @@ end
 local Simpliciton   = {}
 Simpliciton.__index = Simpliciton
 
-DBG("LOAD", "Simpliciton v3.1 loading…")
+DBG("LOAD", "Simpliciton v3.2 loading…")
 
--- ── Services (each wrapped so a missing service won't crash) ──
+-- ── Services  (Rayfield-style: cloneref support + pcall) ─────
 local function GetSvc(name)
 	local ok, svc = pcall(game.GetService, game, name)
-	if ok then return svc end
-	WARN("SERVICE", "Failed to get " .. name)
-	return nil
+	if not ok then
+		WARN("SERVICE", "Failed to get " .. name)
+		return nil
+	end
+	-- cloneref isolates the service from game metatable hooks
+	-- (common anti-cheat technique; safe no-op if unavailable)
+	return (cloneref and cloneref(svc)) or svc
 end
 
 local Players          = GetSvc("Players")
@@ -1244,22 +1228,26 @@ function Simpliciton:CreateSlider(opts)
 		update(min + (max - min) * pct, true)
 	end
 
+	-- Rayfield-style: Stepped loop inside MouseButton1Down avoids
+	-- global UIS connections that accumulate per-element.
 	track.InputBegan:Connect(function(i)
-		if i.UserInputType == Enum.UserInputType.MouseButton1 then
-			dragging = true; applyDrag(i.Position.X)
-		end
-	end)
-	knob.InputBegan:Connect(function(i)
-		if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = true end
-	end)
-
-	local c1 = UserInputService.InputChanged:Connect(function(i)
-		if dragging and i.UserInputType == Enum.UserInputType.MouseMovement then applyDrag(i.Position.X) end
+		if i.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+		dragging = true
+		applyDrag(i.Position.X)
+		local loop; loop = RunService and RunService.Stepped:Connect(function()
+			if not dragging then
+				loop:Disconnect()
+				return
+			end
+			if UserInputService then
+				applyDrag(UserInputService:GetMouseLocation().X)
+			end
+		end)
+		if loop then table.insert(win.Connections, loop) end
 	end)
 	local c2 = UserInputService.InputEnded:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1 then dragging = false end
 	end)
-	table.insert(win.Connections, c1)
 	table.insert(win.Connections, c2)
 
 	frame.MouseEnter:Connect(function() Tween(frame, { BackgroundColor3 = th.Tertiary }) end)
@@ -1632,7 +1620,8 @@ function Simpliciton:CreateButton(opts)
 	btn.MouseButton1Click:Connect(function()
 		if not enabled then return end
 		Tween(btn, { BackgroundColor3 = Color3.new(1,1,1) }, TI_FAST)
-		task.delay(0.08, function()
+		task.spawn(function()
+			task.wait(0.08)
 			Tween(btn, { BackgroundColor3 = th.Accent }, TI_MID)
 		end)
 		if opts.Callback then pcall(opts.Callback) end
@@ -2135,50 +2124,49 @@ function Simpliciton:CreateColorPicker(opts)
 		if opts.Flag     then win.Flags[opts.Flag] = color end
 	end
 
-	-- ── SV drag ──────────────────────────────────────────
+	-- ── SV drag (Rayfield-style: Stepped loop + GetMouse) ──────
 	local svDragging = false
+	local cpMouse = LocalPlayer and LocalPlayer:GetMouse()
 	local function applySV(x, y)
 		sat = math.clamp((x - svBox.AbsolutePosition.X) / svBox.AbsoluteSize.X, 0, 1)
 		val = 1 - math.clamp((y - svBox.AbsolutePosition.Y) / svBox.AbsoluteSize.Y, 0, 1)
 		rebuild()
 	end
 	svBox.InputBegan:Connect(function(i)
-		if i.UserInputType == Enum.UserInputType.MouseButton1 then
-			svDragging = true; applySV(i.Position.X, i.Position.Y)
-		end
+		if i.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+		svDragging = true
+		applySV(i.Position.X, i.Position.Y)
+		local loop; loop = RunService and RunService.Stepped:Connect(function()
+			if not svDragging then loop:Disconnect() return end
+			if cpMouse then applySV(cpMouse.X, cpMouse.Y) end
+		end)
+		if loop then table.insert(win.Connections, loop) end
 	end)
-	local cSV1 = UserInputService.InputChanged:Connect(function(i)
-		if svDragging and i.UserInputType == Enum.UserInputType.MouseMovement then
-			applySV(i.Position.X, i.Position.Y)
-		end
-	end)
-	local cSV2 = UserInputService.InputEnded:Connect(function(i)
+	local cSV2 = UserInputService and UserInputService.InputEnded:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1 then svDragging = false end
 	end)
-	table.insert(win.Connections, cSV1)
-	table.insert(win.Connections, cSV2)
+	if cSV2 then table.insert(win.Connections, cSV2) end
 
-	-- ── Hue drag ─────────────────────────────────────────
+	-- ── Hue drag (Stepped loop) ─────────────────────────────────
 	local hueDragging = false
 	local function applyHue(x)
 		hue = math.clamp((x - hueBar.AbsolutePosition.X) / hueBar.AbsoluteSize.X, 0, 0.9999)
 		rebuild()
 	end
 	hueBar.InputBegan:Connect(function(i)
-		if i.UserInputType == Enum.UserInputType.MouseButton1 then
-			hueDragging = true; applyHue(i.Position.X)
-		end
+		if i.UserInputType ~= Enum.UserInputType.MouseButton1 then return end
+		hueDragging = true
+		applyHue(i.Position.X)
+		local loop; loop = RunService and RunService.Stepped:Connect(function()
+			if not hueDragging then loop:Disconnect() return end
+			if cpMouse then applyHue(cpMouse.X) end
+		end)
+		if loop then table.insert(win.Connections, loop) end
 	end)
-	local cH1 = UserInputService.InputChanged:Connect(function(i)
-		if hueDragging and i.UserInputType == Enum.UserInputType.MouseMovement then
-			applyHue(i.Position.X)
-		end
-	end)
-	local cH2 = UserInputService.InputEnded:Connect(function(i)
+	local cH2 = UserInputService and UserInputService.InputEnded:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1 then hueDragging = false end
 	end)
-	table.insert(win.Connections, cH1)
-	table.insert(win.Connections, cH2)
+	if cH2 then table.insert(win.Connections, cH2) end
 
 	-- ── Hex input ─────────────────────────────────────────
 	hexBox.FocusLost:Connect(function()
@@ -2314,12 +2302,12 @@ function Simpliciton:Notify(title, content, duration, notifType)
 		TweenInfo.new(duration, Enum.EasingStyle.Linear))
 
 	-- Dismiss after duration
-	task.delay(duration, function()
+	task.spawn(function()
+		task.wait(duration)
 		if notif and notif.Parent then
 			Tween(notif, { BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 0) }, TI_MID)
-			task.delay(0.3, function()
-				if notif and notif.Parent then notif:Destroy() end
-			end)
+			task.wait(0.3)
+			if notif and notif.Parent then notif:Destroy() end
 		end
 	end)
 
@@ -2327,7 +2315,8 @@ function Simpliciton:Notify(title, content, duration, notifType)
 	notif.InputBegan:Connect(function(i)
 		if i.UserInputType == Enum.UserInputType.MouseButton1 then
 			Tween(notif, { BackgroundTransparency = 1 }, TI_FAST)
-			task.delay(0.15, function()
+			task.spawn(function()
+				task.wait(0.15)
 				if notif and notif.Parent then notif:Destroy() end
 			end)
 		end
@@ -2338,28 +2327,68 @@ end
 --  CONFIG SYSTEM
 -- ============================================================
 
+-- ── Filesystem helpers (Rayfield pattern: callSafely wrappers) ─
+local function _fsCall(fn, ...)
+	if not fn then return nil end
+	local ok, r = pcall(fn, ...)
+	if not ok then WARN("Filesystem", tostring(r)) return nil end
+	return r
+end
+
 function Simpliciton:SaveConfig(fileName)
+	if not self.ConfigSaving.Enabled then
+		self:Notify("Config", "Config saving is disabled.", 3, "error")
+		return
+	end
 	fileName = fileName or self.ConfigSaving.FileName
 	local ok, data = pcall(HttpService.JSONEncode, HttpService, self.Flags)
 	if not ok then
-		self:Notify("Config Error", "Failed to encode configuration.", 3, "error")
+		self:Notify("Config Error", "Failed to encode flags.", 3, "error")
 		return
 	end
-	-- writefile(fileName, data)  ← uncomment in executor environment
-	print("[Simpliciton] Config saved to: " .. fileName)
-	print(data)
-	self:Notify("Config Saved", "Flags written to console.\n(" .. fileName .. ")", 3, "success")
+	if writefile and isfile then
+		-- Executor environment: write to disk
+		local folder = self.ConfigSaving.FolderName or "SimplicitonConfigs"
+		if isfolder and not _fsCall(isfolder, folder) then
+			_fsCall(makefolder, folder)
+		end
+		_fsCall(writefile, folder .. "/" .. fileName .. ".json", data)
+		self:Notify("Saved!", "Config written to " .. folder .. "/" .. fileName .. ".json", 3, "success")
+	else
+		-- Fallback: print to console
+		print("[Simpliciton] Config (no filesystem):\n" .. data)
+		self:Notify("Saved!", "No filesystem available - flags printed to console.", 3, "info")
+	end
 end
 
 function Simpliciton:LoadConfig(fileName)
+	if not self.ConfigSaving.Enabled then return end
 	fileName = fileName or self.ConfigSaving.FileName
-	-- In executor: local data = readfile(fileName)
-	-- For demo, we'll just show the current flags
-	local ok, data = pcall(HttpService.JSONEncode, HttpService, self.Flags)
-	if ok then
-		self:Notify("Config", "Loaded config from:\n" .. fileName, 3, "info")
+	local folder = self.ConfigSaving.FolderName or "SimplicitonConfigs"
+	local path   = folder .. "/" .. fileName .. ".json"
+
+	if not (isfile and _fsCall(isfile, path)) then
+		self:Notify("Config", "No saved config found for: " .. fileName, 3, "info")
+		return
 	end
-	-- After loading, you would iterate over decoded table and set Flags + fire callbacks
+
+	local raw = _fsCall(readfile, path)
+	if not raw then
+		self:Notify("Config Error", "Failed to read config file.", 3, "error")
+		return
+	end
+
+	local ok, data = pcall(HttpService.JSONDecode, HttpService, raw)
+	if not ok then
+		self:Notify("Config Error", "Corrupt config file.", 3, "error")
+		return
+	end
+
+	-- Apply all flag values
+	for flagName, flagValue in pairs(data) do
+		self.Flags[flagName] = flagValue
+	end
+	self:Notify("Loaded", "Config loaded from: " .. path, 3, "success")
 end
 
 -- ============================================================
@@ -2534,11 +2563,11 @@ function Simpliciton:_BuildSettingsTab()
 	tab:CreateSection("About")
 
 	tab:CreateParagraph({
-		Title   = "Simpliciton  v3.0",
+		Title   = "Simpliciton  v3.2",
 		Content = "Full-featured Roblox UI framework.\n"
-			.. "Architecture: polymorphic metatable, live theming, element registry, "
-			.. "search system, tooltip engine, HSV color picker, multi-dropdown, "
-			.. "config serialisation, group containers, and stacking notifications.",
+			.. "Rayfield-patterned: cloneref services, Stepped-loop dragging, "
+			.. "task.spawn notifications, filesystem config, live theming, "
+			.. "HSV color picker, multi-dropdown, group containers, tooltips.",
 	})
 end
 
