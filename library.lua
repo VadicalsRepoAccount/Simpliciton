@@ -1,4 +1,4 @@
-local DEBUG = false   -- ← flip to true to enable debug logging
+local DEBUG = true   -- ← flip to true to enable debug logging
 
 local function DBG(tag, msg)
 	if not DEBUG then return end
