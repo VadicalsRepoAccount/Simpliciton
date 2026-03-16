@@ -1,4 +1,4 @@
-local DEBUG = true   -- ← flip to true to enable debug logging
+local DEBUG = false   -- ← flip to true to enable debug logging
 
 local function DBG(tag, msg)
 	if not DEBUG then return end
@@ -17,7 +17,7 @@ end
 local Simpliciton   = {}
 Simpliciton.__index = Simpliciton
 
-DBG("LOAD", "Simpliciton v3.2 loading…")
+DBG("LOAD", "Simpliciton v3.3 loading…")
 
 -- ── Services  (Rayfield-style: cloneref support + pcall) ─────
 local function GetSvc(name)
@@ -283,16 +283,44 @@ function Simpliciton:_Build()
 	DBG("_Build", "start")
 	local th = self.Theme
 
-	-- ── ScreenGui ───────────────────────────────────────
+	-- ── ScreenGui (Rayfield-style GUI protection) ───────────
 	local sg = New("ScreenGui", {
 		Name           = "SimplicitonUI",
 		ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 		ResetOnSpawn   = false,
 		DisplayOrder   = 120,
-		Parent         = PlayerGui,
 	})
+	-- Parent safely: prefer protected containers so anti-cheat can't see it
+	local CoreGui = GetSvc("CoreGui")
+	local guiParented = false
+	if gethui then
+		pcall(function() sg.Parent = gethui(); guiParented = true end)
+	end
+	if not guiParented and syn and syn.protect_gui then
+		pcall(function() syn.protect_gui(sg); sg.Parent = CoreGui; guiParented = true end)
+	end
+	if not guiParented and CoreGui then
+		pcall(function()
+			local RobloxGui = CoreGui:FindFirstChild("RobloxGui")
+			sg.Parent = RobloxGui or CoreGui
+			guiParented = true
+		end)
+	end
+	if not guiParented then
+		sg.Parent = PlayerGui
+	end
+	-- Kill duplicate instances from previous runs
+	local sgName = sg.Name
+	local container = sg.Parent
+	if container then
+		for _, child in ipairs(container:GetChildren()) do
+			if child.Name == sgName and child ~= sg then
+				pcall(function() child:Destroy() end)
+			end
+		end
+	end
 	self.ScreenGui = sg
-	DBG("_Build", "ScreenGui created")
+	DBG("_Build", "ScreenGui created, parent=" .. tostring(sg.Parent))
 
 	-- ── Shadow ──────────────────────────────────────────
 	local shadow = New("ImageLabel", {
@@ -316,7 +344,7 @@ function Simpliciton:_Build()
 		Position         = UDim2.new(0.5, -355, 0.5, -240),
 		BackgroundColor3 = th.Background,
 		BorderSizePixel  = 0,
-		ClipsDescendants = true,
+		ClipsDescendants = false,
 		Parent           = sg,
 	})
 	Corner(main)
@@ -335,7 +363,7 @@ function Simpliciton:_Build()
 	})
 	Corner(header)
 	-- Fill bottom gap so header looks rectangular on the bottom edge
-	New("Frame", {
+	local headerFiller = New("Frame", {
 		Size             = UDim2.new(1, 0, 0.5, 0),
 		Position         = UDim2.new(0, 0, 0.5, 0),
 		BackgroundColor3 = th.Accent,
@@ -344,7 +372,8 @@ function Simpliciton:_Build()
 		Parent           = header,
 	})
 	self.Header = header
-	BindTheme(self, header, "BackgroundColor3", "Accent")
+	BindTheme(self, header,       "BackgroundColor3", "Accent")
+	BindTheme(self, headerFiller, "BackgroundColor3", "Accent")
 
 	-- Subtle header gradient
 	New("UIGradient", {
@@ -444,6 +473,7 @@ function Simpliciton:_Build()
 		Position               = UDim2.new(0, 170, 0, 60),
 		BackgroundTransparency = 1,
 		BorderSizePixel        = 0,
+		ClipsDescendants       = false,  -- dropdowns/pickers must overflow
 		Parent                 = main,
 	})
 	self.ContentArea = content
@@ -710,6 +740,7 @@ function Simpliciton:CreateTab(name, iconId)
 		ScrollBarThickness   = 4,
 		ScrollBarImageColor3 = Color3.fromRGB(60, 60, 80),
 		BackgroundTransparency = 1,
+		ClipsDescendants     = false,  -- allow dropdown/picker overflow
 		Visible              = false,
 		BorderSizePixel      = 0,
 		Parent               = self.ContentArea,
@@ -1146,9 +1177,17 @@ function Simpliciton:CreateSlider(opts)
 	local th = GetTheme(self)
 	opts = opts or {}
 
-	local min      = opts.Min      or 0
-	local max      = opts.Max      or 100
-	local dec      = opts.Decimals or 0
+	-- Accept Rayfield-style Range={min,max}/Increment OR Min/Max/Decimals
+	local min, max
+	if opts.Range and type(opts.Range) == "table" then
+		min = opts.Range[1] or 0
+		max = opts.Range[2] or 100
+	else
+		min = opts.Min or 0
+		max = opts.Max or 100
+	end
+	local inc = opts.Increment  -- Rayfield uses Increment for step
+	local dec = opts.Decimals or (inc and 0) or 0
 	local value    = math.clamp(opts.CurrentValue or min, min, max)
 
 	local frame = New("Frame", {
@@ -1225,7 +1264,11 @@ function Simpliciton:CreateSlider(opts)
 
 	local function applyDrag(xPos)
 		local pct = math.clamp((xPos - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
-		update(min + (max - min) * pct, true)
+		local raw = min + (max - min) * pct
+		if inc and inc > 0 then
+			raw = math.floor(raw / inc + 0.5) * inc
+		end
+		update(raw, true)
 	end
 
 	-- Rayfield-style: Stepped loop inside MouseButton1Down avoids
@@ -1928,7 +1971,7 @@ function Simpliciton:CreateColorPicker(opts)
 	local th = GetTheme(self)
 	opts = opts or {}
 
-	local startColor = opts.CurrentValue or Color3.fromRGB(230, 80, 80)
+	local startColor = opts.Color or opts.CurrentValue or Color3.fromRGB(230, 80, 80)
 	local h0, s0, v0 = Color3.toHSV(startColor)
 	local hue, sat, val = h0, s0, v0
 
@@ -2213,7 +2256,15 @@ end
 --  NOTIFICATIONS (auto-stacking)
 -- ============================================================
 
-function Simpliciton:Notify(title, content, duration, notifType)
+function Simpliciton:Notify(titleOrData, content, duration, notifType)
+	-- Accept Rayfield table-style: Notify({Title=, Content=, Duration=}) OR positional
+	local title = titleOrData
+	if type(titleOrData) == "table" then
+		title     = titleOrData.Title    or titleOrData.title    or "Notice"
+		content   = titleOrData.Content  or titleOrData.content  or ""
+		duration  = titleOrData.Duration or titleOrData.duration or 4
+		notifType = titleOrData.Type     or notifType
+	end
 	DBG("Notify", tostring(title))
 	duration  = duration  or 4
 	notifType = notifType or "info"
@@ -2563,7 +2614,7 @@ function Simpliciton:_BuildSettingsTab()
 	tab:CreateSection("About")
 
 	tab:CreateParagraph({
-		Title   = "Simpliciton  v3.2",
+		Title   = "Simpliciton  v3.3",
 		Content = "Full-featured Roblox UI framework.\n"
 			.. "Rayfield-patterned: cloneref services, Stepped-loop dragging, "
 			.. "task.spawn notifications, filesystem config, live theming, "
@@ -2572,8 +2623,23 @@ function Simpliciton:_BuildSettingsTab()
 end
 
 -- ============================================================
---  CLEANUP
+--  CLEANUP + ALIASES (matching Rayfield API surface)
 -- ============================================================
+
+-- Rayfield-compatible aliases
+function Simpliciton:LoadConfiguration()
+	self:LoadConfig()
+end
+
+function Simpliciton:SetVisibility(v)
+	self._visible = v
+	if self.MainFrame then self.MainFrame.Visible = v end
+	if self._shadow   then self._shadow.Visible   = v end
+end
+
+function Simpliciton:IsVisible()
+	return self._visible ~= false
+end
 
 function Simpliciton:Destroy()
 	-- Stop rainbow
