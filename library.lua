@@ -1,46 +1,68 @@
 -- ============================================================
---  Simpliciton  |  v3.0  "Framework Edition"
+--  Simpliciton  |  v3.1  "Framework Edition"
+--  Fixed: Font API, AutomaticCanvasSize, DEBUG system
 -- ============================================================
 --
---  NEW IN v3.0
+--  FIXES vs v3.0
 --  ─────────────────────────────────────────────────────────
---  Architecture
---    · Per-window Theme table + SetTheme() with live re-theming
---    · ThemedInstances registry  → all UI colors update together
---    · tab.ElementList           → powers the search system
---    · All element handles expose  :SetVisible()  :SetText()  :Destroy()
+--  · Font.new() / FontFace / Enum.FontWeight  → Enum.Font.X
+--    (Font.new is 2022+ only; Enum.Font works on all versions)
+--  · AutomaticCanvasSize fallback via UIListLayout watcher
+--    (silently fails on older clients; now always works)
+--  · DEBUG flag  – enable at top for full trace output
+--  · Every major operation wrapped in pcall with warn output
+--  · Services resolved safely (pcall GetService)
 --
---  New controls
---    · CreateGroup()         – titled, collapsible element containers
---    · CreateMultiDropdown() – checkbox multi-select dropdown
---    · CreateProgress()      – animated read-only progress bar
---    · CreateDivider()       – section separator line
---    · CreateColorPicker()   – full HSV gradient picker + hex input
---    · CreateKeybind()       – hold / toggle / callback modes
---
---  New window features
---    · EnableSearch()        – live element name filter on any tab
---    · Notify()              – auto-stacking bottom-right queue
---    · SaveConfig/LoadConfig – JSON flag serialisation
---    · SetWatermark()        – detachable HUD label
---    · SetKeybind()          – global visibility toggle
---    · SetTitle()            – rename window at runtime
---    · Tooltip system        – hover descriptions on any element
---    · Minimize / Maximize   – animated collapse with memory
+--  HOW TO ENABLE DEBUG
+--    Set  DEBUG = true  on the line below.
+--    All [Simpliciton] output will appear in the dev console.
 -- ============================================================
+
+local DEBUG = true   -- ← flip to true to enable debug logging
+
+local function DBG(tag, msg)
+	if not DEBUG then return end
+	print(string.format("[Simpliciton][%s] %s", tag, tostring(msg)))
+end
+local function WARN(tag, msg)
+	-- Always warn on errors regardless of DEBUG flag
+	warn(string.format("[Simpliciton][%s] %s", tag, tostring(msg)))
+end
+local function SAFE(tag, fn, ...)
+	local ok, err = pcall(fn, ...)
+	if not ok then WARN(tag, err) end
+	return ok
+end
 
 local Simpliciton   = {}
 Simpliciton.__index = Simpliciton
 
--- ── Services ──────────────────────────────────────────────
-local Players          = game:GetService("Players")
-local TweenService     = game:GetService("TweenService")
-local UserInputService = game:GetService("UserInputService")
-local RunService       = game:GetService("RunService")
-local HttpService      = game:GetService("HttpService")
+DBG("LOAD", "Simpliciton v3.1 loading…")
 
-local LocalPlayer = Players.LocalPlayer
-local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
+-- ── Services (each wrapped so a missing service won't crash) ──
+local function GetSvc(name)
+	local ok, svc = pcall(game.GetService, game, name)
+	if ok then return svc end
+	WARN("SERVICE", "Failed to get " .. name)
+	return nil
+end
+
+local Players          = GetSvc("Players")
+local TweenService     = GetSvc("TweenService")
+local UserInputService = GetSvc("UserInputService")
+local RunService       = GetSvc("RunService")
+local HttpService      = GetSvc("HttpService")
+
+DBG("LOAD", "Services resolved")
+
+local LocalPlayer = Players and Players.LocalPlayer
+local PlayerGui   = LocalPlayer and LocalPlayer:WaitForChild("PlayerGui")
+
+if not PlayerGui then
+	WARN("LOAD", "PlayerGui not found – UI cannot be created")
+end
+
+DBG("LOAD", "PlayerGui ready")
 
 -- ── Default Theme  (copied per-window; never mutate this) ──
 Simpliciton.DefaultTheme = {
@@ -72,7 +94,10 @@ Simpliciton.Elements = {}
 
 local function Tween(obj, props, ti)
 	if not obj or not obj.Parent then return end
-	TweenService:Create(obj, ti or TI_FAST, props):Play()
+	if not TweenService then return end
+	pcall(function()
+		TweenService:Create(obj, ti or TI_FAST, props):Play()
+	end)
 end
 
 local function New(class, props, parent)
@@ -107,10 +132,43 @@ end
 
 local function VList(inst, gap)
 	New("UIListLayout", {
-		Padding     = UDim.new(0, gap or 6),
-		SortOrder   = Enum.SortOrder.LayoutOrder,
+		Padding       = UDim.new(0, gap or 6),
+		SortOrder     = Enum.SortOrder.LayoutOrder,
 		FillDirection = Enum.FillDirection.Vertical,
 	}, inst)
+end
+
+-- ScrollVList: creates a UIListLayout AND auto-sizes the scrollframe canvas.
+-- Uses AutomaticCanvasSize (new API) and falls back to AbsoluteContentSize
+-- watcher (old-API compatible). Always works regardless of executor version.
+local function ScrollVList(scrollFrame, gap, extraPad)
+	local layout = New("UIListLayout", {
+		Padding       = UDim.new(0, gap or 6),
+		SortOrder     = Enum.SortOrder.LayoutOrder,
+		FillDirection = Enum.FillDirection.Vertical,
+	}, scrollFrame)
+
+	-- Try the new AutomaticCanvasSize property (2021+)
+	pcall(function()
+		scrollFrame.AutomaticCanvasSize = Enum.AutomaticSize.Y
+	end)
+
+	-- Fallback: always resize via AbsoluteContentSize
+	-- (harmless double-resize on new clients; essential on old ones)
+	local pad = extraPad or 0
+	local function resize()
+		if scrollFrame and scrollFrame.Parent then
+			scrollFrame.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + pad)
+		end
+	end
+	layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(resize)
+	resize()
+	return layout
+end
+
+-- SafeAutoSize: sets AutomaticSize (post-2019 API) with silent fallback.
+local function SafeAuto(inst, axis)
+	pcall(function() inst.AutomaticSize = axis end)
 end
 
 local function GetWindow(self)
@@ -205,6 +263,7 @@ end
 
 function Simpliciton:CreateWindow(opts)
 	opts = opts or {}
+	DBG("CreateWindow", "Name=" .. tostring(opts.Name or "Simpliciton"))
 	local win = setmetatable({}, Simpliciton)
 
 	-- Deep-copy DefaultTheme so each window has its own mutable theme
@@ -224,13 +283,20 @@ function Simpliciton:CreateWindow(opts)
 	win._fullHeight      = 480
 	win._notifOrder      = 0
 
-	win:_Build()
-	win:_BuildSettingsTab()
+	DBG("CreateWindow", "Building interface…")
+	local ok, err = pcall(function() win:_Build() end)
+	if not ok then WARN("_Build", err) return win end
+	DBG("CreateWindow", "_Build done")
+
+	local ok2, err2 = pcall(function() win:_BuildSettingsTab() end)
+	if not ok2 then WARN("_BuildSettingsTab", err2) end
+	DBG("CreateWindow", "Ready")
 
 	return win
 end
 
 function Simpliciton:_Build()
+	DBG("_Build", "start")
 	local th = self.Theme
 
 	-- ── ScreenGui ───────────────────────────────────────
@@ -242,6 +308,7 @@ function Simpliciton:_Build()
 		Parent         = PlayerGui,
 	})
 	self.ScreenGui = sg
+	DBG("_Build", "ScreenGui created")
 
 	-- ── Shadow ──────────────────────────────────────────
 	local shadow = New("ImageLabel", {
@@ -314,7 +381,7 @@ function Simpliciton:_Build()
 		Size                   = UDim2.new(1, -120, 1, 0),
 		Position               = UDim2.new(0, 20, 0, 0),
 		BackgroundTransparency = 1,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Bold),
+		Font                   = Enum.Font.GothamBold,
 		TextSize               = 17,
 		TextColor3             = Color3.new(1,1,1),
 		TextXAlignment         = Enum.TextXAlignment.Left,
@@ -333,7 +400,7 @@ function Simpliciton:_Build()
 		Text             = "–",
 		TextColor3       = Color3.fromRGB(120, 80, 0),
 		TextSize         = 16,
-		FontFace         = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Bold),
+		Font             = Enum.Font.GothamBold,
 		ZIndex           = 5,
 		Parent           = header,
 	})
@@ -353,7 +420,7 @@ function Simpliciton:_Build()
 		Text             = "×",
 		TextColor3       = Color3.new(1,1,1),
 		TextSize         = 19,
-		FontFace         = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Bold),
+		Font             = Enum.Font.GothamBold,
 		ZIndex           = 5,
 		Parent           = header,
 	})
@@ -367,14 +434,13 @@ function Simpliciton:_Build()
 		Size                 = UDim2.new(0, 162, 1, -60),
 		Position             = UDim2.new(0, 0, 0, 60),
 		CanvasSize           = UDim2.new(),
-		AutomaticCanvasSize  = Enum.AutomaticSize.Y,
 		ScrollBarThickness   = 3,
 		ScrollBarImageColor3 = th.Accent,
 		BackgroundTransparency = 1,
 		BorderSizePixel      = 0,
 		Parent               = main,
 	})
-	VList(sidebar, 4)
+	ScrollVList(sidebar, 4, 10+8)  -- 10 bottom + 8 top padding
 	Pad(sidebar, 6, 6, 8, 10)
 	self.Sidebar = sidebar
 
@@ -421,6 +487,7 @@ function Simpliciton:_Build()
 	self._tooltipLabel = ttLabel
 
 	self:_MakeDraggable(header)
+	DBG("_Build", "complete")
 end
 
 function Simpliciton:_MakeDraggable(handle)
@@ -532,7 +599,7 @@ function Simpliciton:SetWatermark(text, subtext)
 		Text                   = text,
 		TextColor3             = Color3.new(1,1,1),
 		TextSize               = 13,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Bold),
+		Font                   = Enum.Font.GothamBold,
 		ZIndex                 = 51,
 		Parent                 = inner,
 	})
@@ -593,6 +660,7 @@ end
 -- ============================================================
 
 function Simpliciton:CreateTab(name, iconId)
+	DBG("CreateTab", name)
 	local tab    = setmetatable({}, Simpliciton)
 	tab.Window   = self
 	tab.Name     = name
@@ -645,7 +713,7 @@ function Simpliciton:CreateTab(name, iconId)
 		Text                   = name,
 		TextColor3             = th.TextDim,
 		TextSize               = 13,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium),
+		Font                   = Enum.Font.GothamMedium,
 		TextXAlignment         = Enum.TextXAlignment.Left,
 		ZIndex                 = 4,
 		Parent                 = btn,
@@ -655,7 +723,6 @@ function Simpliciton:CreateTab(name, iconId)
 	local page = New("ScrollingFrame", {
 		Size                 = UDim2.new(1, 0, 1, 0),
 		CanvasSize           = UDim2.new(),
-		AutomaticCanvasSize  = Enum.AutomaticSize.Y,
 		ScrollBarThickness   = 4,
 		ScrollBarImageColor3 = Color3.fromRGB(60, 60, 80),
 		BackgroundTransparency = 1,
@@ -663,7 +730,7 @@ function Simpliciton:CreateTab(name, iconId)
 		BorderSizePixel      = 0,
 		Parent               = self.ContentArea,
 	})
-	VList(page, 7)
+	ScrollVList(page, 7, 12+20)  -- 12 top + 20 bottom padding
 	Pad(page, 14, 14, 12, 20)
 
 	tab.Button    = btn
@@ -708,6 +775,7 @@ end
 --- Adds a live search box to the top of the tab's page.
 --- Filters element containers by their registered name.
 function Simpliciton:EnableSearch()
+	DBG("EnableSearch", "called")
 	local page = GetPage(self)
 	if not page then return end
 	local th = GetTheme(self)
@@ -763,6 +831,7 @@ end
 -- ============================================================
 
 function Simpliciton:CreateGroup(title, startCollapsed)
+	DBG("CreateGroup", "called")
 	local page = GetPage(self)
 	local win  = GetWindow(self)
 	if not page then return end
@@ -809,7 +878,7 @@ function Simpliciton:CreateGroup(title, startCollapsed)
 		Text                   = title,
 		TextColor3             = th.Text,
 		TextSize               = 13,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.SemiBold),
+		Font                   = Enum.Font.GothamSemibold,
 		TextXAlignment         = Enum.TextXAlignment.Left,
 		ZIndex                 = 3,
 		Parent                 = headerRow,
@@ -865,6 +934,7 @@ end
 
 -- ── Section ──────────────────────────────────────────────────
 function Simpliciton:CreateSection(title)
+	DBG("CreateSection", "called")
 	local page = GetPage(self)
 	if not page then return end
 	local th = GetTheme(self)
@@ -881,7 +951,7 @@ function Simpliciton:CreateSection(title)
 		Text                   = title:upper(),
 		TextColor3             = th.Accent,
 		TextSize               = 10,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Bold),
+		Font                   = Enum.Font.GothamBold,
 		TextXAlignment         = Enum.TextXAlignment.Left,
 		Parent                 = frame,
 	})
@@ -898,6 +968,7 @@ end
 
 -- ── Label ────────────────────────────────────────────────────
 function Simpliciton:CreateLabel(text, tooltip)
+	DBG("CreateLabel", "called")
 	local page = GetPage(self)
 	if not page then return end
 	local th = GetTheme(self)
@@ -930,6 +1001,7 @@ end
 
 -- ── Divider ──────────────────────────────────────────────────
 function Simpliciton:CreateDivider()
+	DBG("CreateDivider", "called")
 	local page = GetPage(self)
 	if not page then return end
 	local th = GetTheme(self)
@@ -953,6 +1025,7 @@ end
 
 -- ── Paragraph ────────────────────────────────────────────────
 function Simpliciton:CreateParagraph(opts)
+	DBG("CreateParagraph", "called")
 	local page = GetPage(self)
 	if not page then return end
 	local th = GetTheme(self)
@@ -975,7 +1048,7 @@ function Simpliciton:CreateParagraph(opts)
 		Text                   = opts.Title   or "Title",
 		TextColor3             = th.Text,
 		TextSize               = 14,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.SemiBold),
+		Font                   = Enum.Font.GothamSemibold,
 		TextXAlignment         = Enum.TextXAlignment.Left,
 		TextWrapped            = true,
 		Parent                 = frame,
@@ -1003,6 +1076,7 @@ end
 
 -- ── Toggle ───────────────────────────────────────────────────
 function Simpliciton:CreateToggle(opts)
+	DBG("CreateToggle", "called")
 	local page = GetPage(self)
 	local win  = GetWindow(self)
 	if not page then return end
@@ -1023,7 +1097,7 @@ function Simpliciton:CreateToggle(opts)
 		Text                   = opts.Name or "Toggle",
 		TextColor3             = th.Text,
 		TextSize               = 13,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium),
+		Font                   = Enum.Font.GothamMedium,
 		TextXAlignment         = Enum.TextXAlignment.Left,
 		Parent                 = frame,
 	})
@@ -1081,6 +1155,7 @@ end
 
 -- ── Slider ───────────────────────────────────────────────────
 function Simpliciton:CreateSlider(opts)
+	DBG("CreateSlider", "called")
 	local page = GetPage(self)
 	local win  = GetWindow(self)
 	if not page then return end
@@ -1106,7 +1181,7 @@ function Simpliciton:CreateSlider(opts)
 		Text                   = opts.Name or "Slider",
 		TextColor3             = th.Text,
 		TextSize               = 13,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium),
+		Font                   = Enum.Font.GothamMedium,
 		TextXAlignment         = Enum.TextXAlignment.Left,
 		Parent                 = frame,
 	})
@@ -1118,7 +1193,7 @@ function Simpliciton:CreateSlider(opts)
 		Text                   = string.format("%." .. dec .. "f", value),
 		TextColor3             = th.Accent,
 		TextSize               = 12,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium),
+		Font                   = Enum.Font.GothamMedium,
 		TextXAlignment         = Enum.TextXAlignment.Right,
 		Parent                 = frame,
 	})
@@ -1203,6 +1278,7 @@ end
 
 -- ── Dropdown ─────────────────────────────────────────────────
 function Simpliciton:CreateDropdown(opts)
+	DBG("CreateDropdown", "called")
 	local page = GetPage(self)
 	local win  = GetWindow(self)
 	if not page then return end
@@ -1229,7 +1305,7 @@ function Simpliciton:CreateDropdown(opts)
 		Text                   = opts.Name or "Dropdown",
 		TextColor3             = th.Text,
 		TextSize               = 13,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium),
+		Font                   = Enum.Font.GothamMedium,
 		TextXAlignment         = Enum.TextXAlignment.Left,
 		ZIndex                 = 6,
 		Parent                 = wrapper,
@@ -1309,11 +1385,12 @@ function Simpliciton:CreateDropdown(opts)
 				if opts.Flag     then win.Flags[opts.Flag] = opt end
 			end)
 		end
-		task.defer(function()
-			if listLayout and listFrame.Parent then
+		coroutine.wrap(function()
+			if RunService then RunService.Heartbeat:Wait() end
+			if listLayout and listFrame and listFrame.Parent then
 				listFrame.Size = UDim2.new(1, 0, 0, listLayout.AbsoluteContentSize.Y + 8)
 			end
-		end)
+		end)()
 	end
 	rebuild()
 
@@ -1348,6 +1425,7 @@ end
 
 -- ── MultiDropdown ────────────────────────────────────────────
 function Simpliciton:CreateMultiDropdown(opts)
+	DBG("CreateMultiDropdown", "called")
 	local page = GetPage(self)
 	local win  = GetWindow(self)
 	if not page then return end
@@ -1376,7 +1454,7 @@ function Simpliciton:CreateMultiDropdown(opts)
 		Text                   = opts.Name or "Multi-Select",
 		TextColor3             = th.Text,
 		TextSize               = 13,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium),
+		Font                   = Enum.Font.GothamMedium,
 		TextXAlignment         = Enum.TextXAlignment.Left,
 		ZIndex                 = 6,
 		Parent                 = wrapper,
@@ -1489,11 +1567,12 @@ function Simpliciton:CreateMultiDropdown(opts)
 			row.MouseEnter:Connect(function() Tween(row, { BackgroundTransparency = 0, BackgroundColor3 = th.Tertiary }) end)
 			row.MouseLeave:Connect(function() Tween(row, { BackgroundTransparency = 1 }) end)
 		end
-		task.defer(function()
-			if listLayout and listFrame.Parent then
+		coroutine.wrap(function()
+			if RunService then RunService.Heartbeat:Wait() end
+			if listLayout and listFrame and listFrame.Parent then
 				listFrame.Size = UDim2.new(1, 0, 0, listLayout.AbsoluteContentSize.Y + 8)
 			end
-		end)
+		end)()
 	end
 	rebuildList()
 
@@ -1530,6 +1609,7 @@ end
 
 -- ── Button ───────────────────────────────────────────────────
 function Simpliciton:CreateButton(opts)
+	DBG("CreateButton", "called")
 	local page = GetPage(self)
 	local win  = GetWindow(self)
 	if not page then return end
@@ -1542,7 +1622,7 @@ function Simpliciton:CreateButton(opts)
 		Text             = opts.Name or "Button",
 		TextColor3       = Color3.new(1,1,1),
 		TextSize         = 13,
-		FontFace         = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.SemiBold),
+		Font             = Enum.Font.GothamSemibold,
 		Parent           = page,
 	})
 	Corner(btn)
@@ -1580,6 +1660,7 @@ end
 
 -- ── TextInput ────────────────────────────────────────────────
 function Simpliciton:CreateInput(opts)
+	DBG("CreateInput", "called")
 	local page = GetPage(self)
 	local win  = GetWindow(self)
 	if not page then return end
@@ -1600,7 +1681,7 @@ function Simpliciton:CreateInput(opts)
 		Text                   = opts.Name or "Input",
 		TextColor3             = th.Text,
 		TextSize               = 13,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium),
+		Font                   = Enum.Font.GothamMedium,
 		TextXAlignment         = Enum.TextXAlignment.Left,
 		Parent                 = frame,
 	})
@@ -1648,6 +1729,7 @@ end
 -- Modes: "Toggle" (default) – fires callback once per press
 --        "Hold"   – fires onHold(true) on press, onHold(false) on release
 function Simpliciton:CreateKeybind(opts)
+	DBG("CreateKeybind", "called")
 	local page = GetPage(self)
 	local win  = GetWindow(self)
 	if not page then return end
@@ -1673,7 +1755,7 @@ function Simpliciton:CreateKeybind(opts)
 		Text                   = opts.Name or "Keybind",
 		TextColor3             = th.Text,
 		TextSize               = 13,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium),
+		Font                   = Enum.Font.GothamMedium,
 		TextXAlignment         = Enum.TextXAlignment.Left,
 		Parent                 = frame,
 	})
@@ -1687,7 +1769,7 @@ function Simpliciton:CreateKeybind(opts)
 		Text                   = mode,
 		TextColor3             = th.TextDim,
 		TextSize               = 10,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Bold),
+		Font                   = Enum.Font.GothamBold,
 		Parent                 = frame,
 	})
 	Corner(modeLbl, 4)
@@ -1764,6 +1846,7 @@ end
 
 -- ── Progress Bar ─────────────────────────────────────────────
 function Simpliciton:CreateProgress(opts)
+	DBG("CreateProgress", "called")
 	local page = GetPage(self)
 	local win  = GetWindow(self)
 	if not page then return end
@@ -1788,7 +1871,7 @@ function Simpliciton:CreateProgress(opts)
 		Text                   = opts.Name or "Progress",
 		TextColor3             = th.Text,
 		TextSize               = 13,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium),
+		Font                   = Enum.Font.GothamMedium,
 		TextXAlignment         = Enum.TextXAlignment.Left,
 		Parent                 = frame,
 	})
@@ -1800,7 +1883,7 @@ function Simpliciton:CreateProgress(opts)
 		Text                   = "0%",
 		TextColor3             = th.Accent,
 		TextSize               = 12,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium),
+		Font                   = Enum.Font.GothamMedium,
 		TextXAlignment         = Enum.TextXAlignment.Right,
 		Parent                 = frame,
 	})
@@ -1849,6 +1932,7 @@ end
 -- • Hex input     – read or type a hex code
 -- • Live preview  – updates in real-time
 function Simpliciton:CreateColorPicker(opts)
+	DBG("CreateColorPicker", "called")
 	local page = GetPage(self)
 	local win  = GetWindow(self)
 	if not page then return end
@@ -1874,7 +1958,7 @@ function Simpliciton:CreateColorPicker(opts)
 		Text                   = opts.Name or "Color",
 		TextColor3             = th.Text,
 		TextSize               = 13,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Medium),
+		Font                   = Enum.Font.GothamMedium,
 		TextXAlignment         = Enum.TextXAlignment.Left,
 		Parent                 = header,
 	})
@@ -2007,7 +2091,7 @@ function Simpliciton:CreateColorPicker(opts)
 		Text                   = "HEX",
 		TextColor3             = th.TextDim,
 		TextSize               = 11,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Bold),
+		Font                   = Enum.Font.GothamBold,
 		Parent                 = hexRow,
 	})
 	local hexBox = New("TextBox", {
@@ -2142,6 +2226,7 @@ end
 -- ============================================================
 
 function Simpliciton:Notify(title, content, duration, notifType)
+	DBG("Notify", tostring(title))
 	duration  = duration  or 4
 	notifType = notifType or "info"
 	local th  = self.Theme
@@ -2202,7 +2287,7 @@ function Simpliciton:Notify(title, content, duration, notifType)
 		Text                   = title,
 		TextColor3             = accent,
 		TextSize               = 13,
-		FontFace               = Font.new("rbxasset://fonts/families/GothamSSm.json", Enum.FontWeight.Bold),
+		Font                   = Enum.Font.GothamBold,
 		TextXAlignment         = Enum.TextXAlignment.Left,
 		TextWrapped            = true,
 		ZIndex                 = 3,
